@@ -233,6 +233,10 @@ final class Session {
     }
 
     func finishAll() async {
+        let stopped = CMClock.hostTimeClock.time
+        for recording in recordings.values {
+            await recording.end(at: stopped)
+        }
         for recording in recordings.values {
             await finish(recording)
         }
@@ -284,10 +288,11 @@ final class Session {
 
     private func finish(_ recording: WindowRecording) async {
         do {
-            try await recording.finish()
-            saved.append(recording.path)
+            if try await recording.finish() == .saved {
+                saved.append(recording.path)
+            }
         } catch {
-            problems.append("\((recording.path as NSString).lastPathComponent) may be unplayable: \(error.localizedDescription)")
+            problems.append("couldn't save \((recording.path as NSString).lastPathComponent): \(error.localizedDescription)")
         }
     }
 }

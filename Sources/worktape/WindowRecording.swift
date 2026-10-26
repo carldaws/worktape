@@ -3,18 +3,23 @@ import Foundation
 import Synchronization
 
 final class WindowRecording {
+    enum Outcome {
+        case saved
+        case nothingCaptured
+    }
+
     let path: String
     private let stream: SCStream
-    private let events: RecordingEvents
+    private let capture: WindowCapture
 
-    private init(path: String, stream: SCStream, events: RecordingEvents) {
+    private init(path: String, stream: SCStream, capture: WindowCapture) {
         self.path = path
         self.stream = stream
-        self.events = events
+        self.capture = capture
     }
 
     var stopReason: String? {
-        events.stopReason
+        capture.stopReason
     }
 
     static func start(_ window: SCWindow, to path: String) async throws -> WindowRecording {
@@ -22,38 +27,45 @@ final class WindowRecording {
         let configuration = SCStreamConfiguration()
         configuration.width = Int(filter.contentRect.width * CGFloat(filter.pointPixelScale))
         configuration.height = Int(filter.contentRect.height * CGFloat(filter.pointPixelScale))
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: WindowCapture.frameRate)
+        configuration.queueDepth = 8
+        configuration.colorSpaceName = CGColorSpace.sRGB
         configuration.showsCursor = false
         configuration.capturesAudio = true
 
-        let recordingConfiguration = SCRecordingOutputConfiguration()
-        recordingConfiguration.outputURL = URL(filePath: path)
-        recordingConfiguration.outputFileType = .mov
-        recordingConfiguration.videoCodecType = .hevc
-
-        let events = RecordingEvents()
-        let stream = SCStream(filter: filter, configuration: configuration, delegate: events)
-        try stream.addRecordingOutput(SCRecordingOutput(configuration: recordingConfiguration, delegate: events))
+        let capture = try WindowCapture(path: path, width: configuration.width, height: configuration.height)
+        let stream = SCStream(filter: filter, configuration: configuration, delegate: capture)
+        do {
+            try stream.addStreamOutput(capture, type: .screen, sampleHandlerQueue: capture.queue)
+            try stream.addStreamOutput(capture, type: .audio, sampleHandlerQueue: capture.queue)
+        } catch {
+            capture.cancel()
+            throw error
+        }
         let failure: (any Error)? = await waitAtMost(.seconds(5), orReturn: CaptureError.timedOut) { done in
             stream.startCapture { done($0) }
         }
-        if let failure { throw failure }
-        return WindowRecording(path: path, stream: stream, events: events)
+        if let failure {
+            await waitAtMost(.seconds(5), orReturn: ()) { done in
+                stream.stopCapture { _ in done(()) }
+            }
+            capture.cancel()
+            throw failure
+        }
+        return WindowRecording(path: path, stream: stream, capture: capture)
     }
 
-    func finish() async throws {
+    func end(at time: CMTime) async {
+        await capture.end(at: time)
+    }
+
+    func finish() async throws -> Outcome {
+        await end(at: CMClock.hostTimeClock.time)
         let stream = stream
         await waitAtMost(.seconds(5), orReturn: ()) { done in
             stream.stopCapture { _ in done(()) }
         }
-        switch await events.next(within: .seconds(5)) {
-        case .finished:
-            return
-        case .failed(let error):
-            throw error
-        case nil:
-            throw CaptureError.timedOut
-        }
+        return try await capture.finish()
     }
 }
 
@@ -83,49 +95,150 @@ func listWindows() async -> WindowList {
     }
 }
 
-private final class RecordingEvents: NSObject, SCRecordingOutputDelegate, SCStreamDelegate, Sendable {
-    enum Event {
-        case finished
-        case failed(any Error)
-    }
+private final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    static let frameRate: Int32 = 60
+    static let framesToWaitBeforeRepeating = 2
 
-    private let events: AsyncStream<Event>
-    private let continuation: AsyncStream<Event>.Continuation
-    private let reason = Mutex<String?>(nil)
+    let queue = DispatchQueue(label: "worktape window capture")
+    private let path: String
+    private let writer: VideoWriter
+    private let streamStop = Mutex<String?>(nil)
+    private let repeater: any DispatchSourceTimer
+    private var start: CMTime?
+    private var ended = false
+    private var latest: CVPixelBuffer?
+    private var nextFrame = 0
+    private var writeFailure: (any Error)?
 
-    override init() {
-        (events, continuation) = AsyncStream.makeStream()
+    init(path: String, width: Int, height: Int) throws {
+        self.path = path
+        writer = try VideoWriter(path: path, fileType: .mov, width: width, height: height, frameRate: Self.frameRate, realTime: true, audio: true)
+        repeater = DispatchSource.makeTimerSource(queue: queue)
+        super.init()
+        repeater.schedule(deadline: .now(), repeating: 1 / Double(Self.frameRate))
+        repeater.setEventHandler { [weak self] in self?.repeatLatestUntilNow() }
+        repeater.resume()
     }
 
     var stopReason: String? {
-        reason.withLock { $0 }
+        streamStop.withLock { $0 }
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard !ended, writeFailure == nil else { return }
+        switch type {
+        case .screen:
+            record(sample)
+        case .audio:
+            if let start {
+                attempt { try writer.appendAudio(sample, from: start) }
+            }
+        default:
+            break
+        }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
-        reason.withLock { $0 = error.localizedDescription }
+        let stopped = CMClock.hostTimeClock.time
+        streamStop.withLock { $0 = error.localizedDescription }
+        queue.async { [self] in endOnQueue(at: stopped) }
     }
 
-    func recordingOutputDidFinishRecording(_ recordingOutput: SCRecordingOutput) {
-        continuation.yield(.finished)
-    }
-
-    func recordingOutput(_ recordingOutput: SCRecordingOutput, didFailWithError error: any Error) {
-        continuation.yield(.failed(error))
-    }
-
-    func next(within timeout: Duration) async -> Event? {
-        await withTaskGroup(of: Event?.self) { group in
-            group.addTask {
-                var iterator = self.events.makeAsyncIterator()
-                return await iterator.next()
+    func end(at time: CMTime) async {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                endOnQueue(at: time)
+                continuation.resume()
             }
-            group.addTask {
-                try? await Task.sleep(for: timeout)
-                return nil
-            }
-            defer { group.cancelAll() }
-            return await group.next() ?? nil
         }
+    }
+
+    func finish() async throws -> WindowRecording.Outcome {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async { [self] in
+                endOnQueue(at: CMClock.hostTimeClock.time)
+                if start == nil || writeFailure != nil {
+                    discard()
+                    continuation.resume(with: writeFailure.map { .failure($0) } ?? .success(.nothingCaptured))
+                    return
+                }
+                do {
+                    try writer.finish(frames: nextFrame)
+                    continuation.resume(returning: .saved)
+                } catch {
+                    discard()
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    func cancel() {
+        queue.async { [self] in discard() }
+    }
+
+    private func discard() {
+        ended = true
+        repeater.cancel()
+        writer.cancel()
+        try? FileManager.default.removeItem(atPath: path)
+    }
+
+    private func endOnQueue(at time: CMTime) {
+        guard !ended else { return }
+        ended = true
+        repeater.cancel()
+        if let start {
+            repeatLatest(through: frame(at: time, from: start))
+        }
+    }
+
+    private func record(_ sample: CMSampleBuffer) {
+        guard let image = sample.imageBuffer, sample.presentationTimeStamp.isValid, Self.hasNewImage(sample) else { return }
+        let start = start ?? sample.presentationTimeStamp
+        self.start = start
+        let frame = frame(at: sample.presentationTimeStamp, from: start)
+        repeatLatest(through: frame - 1)
+        latest = image
+        if frame >= nextFrame {
+            write(image, frame: frame)
+        }
+    }
+
+    private func repeatLatestUntilNow() {
+        guard let start else { return }
+        repeatLatest(through: frame(at: CMClock.hostTimeClock.time, from: start) - Self.framesToWaitBeforeRepeating)
+    }
+
+    private func repeatLatest(through frame: Int) {
+        guard let latest else { return }
+        while nextFrame <= frame && writeFailure == nil {
+            write(latest, frame: nextFrame)
+        }
+    }
+
+    private func write(_ image: CVPixelBuffer, frame: Int) {
+        attempt { try writer.append(image, frame: frame) }
+        nextFrame = frame + 1
+    }
+
+    private func attempt(_ write: () throws -> Void) {
+        do {
+            try write()
+        } catch {
+            writeFailure = error
+        }
+    }
+
+    private func frame(at time: CMTime, from start: CMTime) -> Int {
+        Int(((time - start).seconds * Double(Self.frameRate)).rounded())
+    }
+
+    private static func hasNewImage(_ sample: CMSampleBuffer) -> Bool {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let status = attachments.first?[.status] as? Int
+        else { return false }
+        return SCFrameStatus(rawValue: status) == .complete
     }
 }
 

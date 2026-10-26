@@ -5,13 +5,14 @@ final class VideoWriter {
     let frameRate: Int32
     private let writer: AVAssetWriter
     private let video: AVAssetWriterInput
+    private let audio: AVAssetWriterInput?
     private let adaptor: AVAssetWriterInputPixelBufferAdaptor
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
-    init(path: String, fileType: AVFileType, width: Int, height: Int, frameRate: Int32) throws {
+    init(path: String, fileType: AVFileType, width: Int, height: Int, frameRate: Int32, realTime: Bool = false, audio withAudio: Bool = false) throws {
         self.frameRate = frameRate
         writer = try AVAssetWriter(outputURL: URL(filePath: path), fileType: fileType)
-        writer.shouldOptimizeForNetworkUse = true
+        writer.shouldOptimizeForNetworkUse = !realTime
         video = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: width,
@@ -25,8 +26,10 @@ final class VideoWriter {
                 AVVideoQualityKey: 0.6,
                 AVVideoExpectedSourceFrameRateKey: frameRate,
                 AVVideoMaxKeyFrameIntervalKey: frameRate * 2,
+                AVVideoAllowFrameReorderingKey: !realTime,
             ],
         ])
+        video.expectsMediaDataInRealTime = realTime
         adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: video, sourcePixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: width,
@@ -34,6 +37,20 @@ final class VideoWriter {
             kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
         ])
         writer.add(video)
+
+        if withAudio {
+            let audio = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 48_000,
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: 192_000,
+            ])
+            audio.expectsMediaDataInRealTime = realTime
+            writer.add(audio)
+            self.audio = audio
+        } else {
+            audio = nil
+        }
 
         guard writer.startWriting() else { throw writer.error ?? VideoWriterError.stopped }
         writer.startSession(atSourceTime: .zero)
@@ -62,8 +79,25 @@ final class VideoWriter {
     }
 
     func append(_ buffer: CVPixelBuffer, frame: Int) throws {
-        try waitUntilReady(video)
+        guard writer.status == .writing else { throw writer.error ?? VideoWriterError.stopped }
+        if video.expectsMediaDataInRealTime {
+            guard video.isReadyForMoreMediaData else { return }
+        } else {
+            try waitUntilReady(video)
+        }
         guard adaptor.append(buffer, withPresentationTime: CMTime(value: Int64(frame), timescale: frameRate)) else {
+            throw writer.error ?? VideoWriterError.stopped
+        }
+    }
+
+    func appendAudio(_ sample: CMSampleBuffer, from start: CMTime) throws {
+        guard let audio, audio.isReadyForMoreMediaData, sample.presentationTimeStamp >= start else { return }
+        let timing = try sample.sampleTimingInfos().map { timing in
+            var shifted = timing
+            shifted.presentationTimeStamp = timing.presentationTimeStamp - start
+            return shifted
+        }
+        guard audio.append(try CMSampleBuffer(copying: sample, withNewTiming: timing)) else {
             throw writer.error ?? VideoWriterError.stopped
         }
     }
@@ -71,6 +105,7 @@ final class VideoWriter {
     func finish(frames: Int) throws {
         guard writer.status == .writing else { throw writer.error ?? VideoWriterError.stopped }
         video.markAsFinished()
+        audio?.markAsFinished()
         writer.endSession(atSourceTime: CMTime(value: Int64(frames), timescale: frameRate))
         let done = DispatchSemaphore(value: 0)
         writer.finishWriting { done.signal() }
