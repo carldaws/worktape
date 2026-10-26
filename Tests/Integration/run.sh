@@ -17,7 +17,7 @@ window=$work/test-window
 mkdir "$work/project" "$work/zdotdir"
 cd "$work/project" && "$worktape" init 2>/dev/null
 
-long='for i in $(seq 1 400); do echo "line $i $RANDOM$RANDOM$RANDOM"; sleep 0.02; done; exit'
+long='for i in $(seq 1 400); do echo "line $i $RANDOM$RANDOM$RANDOM"; sleep 0.02; done'
 crashes_before=$(ls ~/Library/Logs/DiagnosticReports | grep -c '^worktape')
 failures=0
 
@@ -42,8 +42,10 @@ start() {
   for _ in $(seq 50); do recorder=$(pgrep -P "$terminal") && break; sleep 0.1; done
 }
 
-child_named() {
-  for _ in $(seq 600); do pgrep -P "$recorder" -x "$1" && return; sleep 0.02; done
+wait_for_rendering() {
+  for _ in $(seq 600); do grep -q rendering "$work/$name.log" && return; sleep 0.05; done
+  echo "FAIL  $name: never started rendering"
+  failures=$((failures + 1))
 }
 
 expect() {
@@ -102,23 +104,15 @@ sleep 5
 kill -KILL "$terminal"
 expect close "1 cast, 1 mp4, 1 mov"
 
-start interrupt-agg "$long"
-kill -INT "$(child_named agg)"
-expect interrupt-agg "1 cast, 0 mp4, 0 mov"
-
-start interrupt-ffmpeg "$long"
-kill -INT "$(child_named ffmpeg)"
-expect interrupt-ffmpeg "1 cast, 0 mp4, 0 mov"
-
-start terminate-render "$long"
-child_named agg > /dev/null
+start terminate-render "$window &" "$long; $worktape stop"
+wait_for_rendering
 kill -TERM "$recorder"
-expect terminate-render "1 cast, 0 mp4, 0 mov"
+expect terminate-render "1 cast, 0 mp4, 1 mov"
 
-start close-render "$long"
-child_named agg > /dev/null
+start close-render "$window &" "$long; $worktape stop"
+wait_for_rendering
 kill -KILL "$terminal"
-expect close-render "1 cast, 1 mp4, 0 mov"
+expect close-render "1 cast, 1 mp4, 1 mov"
 
 sleep 1
 if [ "$(ls ~/Library/Logs/DiagnosticReports | grep -c '^worktape')" != "$crashes_before" ]; then

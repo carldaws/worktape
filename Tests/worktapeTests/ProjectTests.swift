@@ -103,25 +103,3 @@ struct SessionTests {
         }
     }
 }
-
-struct RenderSizeTests {
-    @Test(arguments: [(80, 24, 32), (319, 87, 17), (2000, 600, 2)])
-    func fitsTheVideoIn4K(columns: Int, rows: Int, expected: Int) {
-        #expect(fontSize(columns: columns, rows: rows) == expected)
-    }
-
-    @Test func readsTheTerminalSizeFromTheCast() async throws {
-        try await withTemporaryDirectory { directory in
-            let cast = directory + "/session.cast"
-            try """
-            {"version":3,"term":{"cols":319,"rows":87,"type":"xterm-ghostty"},"timestamp":1792677978}
-            [0.095, "o", "hello"]
-            """.write(toFile: cast, atomically: true, encoding: .utf8)
-            let size = try #require(await terminalSize(of: cast))
-            #expect(size.columns == 319 && size.rows == 87)
-            await #expect(throws: (any Error).self) {
-                try await terminalSize(of: directory + "/missing.cast")
-            }
-        }
-    }
-}

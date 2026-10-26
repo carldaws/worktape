@@ -66,6 +66,7 @@ func record(_ description: String? = nil) async -> Int32 {
 
     let titleBarHeight = await standardTitleBarHeight()
     recorderPID.store(asciinema.pid, ordering: .relaxed)
+    session.startTerminalVideo()
     var wasPaused = false
     while !asciinema.hasExited() && !session.lostPermission {
         let paused = asciinemaConfig?.isPaused ?? false
@@ -90,7 +91,7 @@ func record(_ description: String? = nil) async -> Int32 {
     Console.stopped(project.name, after: ContinuousClock.now - started)
 
     await session.finishAll()
-    await session.renderTerminal()
+    await session.finishTerminalVideo()
     session.report()
     session.removeDirectoryIfEmpty()
     return session.lostPermission ? 1 : asciinema.exitCode ?? 1
@@ -98,7 +99,7 @@ func record(_ description: String? = nil) async -> Int32 {
 
 private let terminalClosed = Atomic(false)
 private let recorderPID = Atomic<pid_t>(0)
-private let renderPID = Atomic<pid_t>(0)
+private let sessionVideo = Mutex<TerminalVideo?>(nil)
 
 private func listenForShutdown() -> [any DispatchSourceSignal] {
     signal(SIGINT, SIG_IGN)
@@ -109,12 +110,11 @@ private func listenForShutdown() -> [any DispatchSourceSignal] {
             if shutdown == SIGHUP {
                 terminalClosed.store(true, ordering: .relaxed)
             }
-            let render = renderPID.load(ordering: .relaxed)
             let recorder = recorderPID.load(ordering: .relaxed)
-            if render != 0 {
-                kill(render, SIGINT)
-            } else if recorder != 0 {
+            if recorder != 0 {
                 endShells(under: recorder)
+            } else if shutdown == SIGTERM {
+                sessionVideo.withLock { $0 }?.cancel()
             }
         }
         source.resume()
@@ -138,7 +138,7 @@ final class Session {
     let directory: String
     let terminal: String
     let directoryInProject: String
-    private var terminalVideo: String?
+    private var terminalVideo: TerminalVideo?
     private var recordings: [CGWindowID: WindowRecording] = [:]
     private var ignored: Set<CGWindowID> = []
     private var issued: Set<String> = []
@@ -168,7 +168,14 @@ final class Session {
         terminal = (directory as NSString).appendingPathComponent("\(name).cast")
     }
 
+    func startTerminalVideo() {
+        let video = TerminalVideo.start(from: terminal, to: (terminal as NSString).deletingPathExtension + ".mp4")
+        terminalVideo = video
+        sessionVideo.withLock { $0 = video }
+    }
+
     func update(under recorder: pid_t, paused: Bool, titleBarHeight: CGFloat) async {
+        defer { terminalVideo?.windowsRecording = !recordings.isEmpty }
         guard !paused else {
             await finishAll()
             return
@@ -230,21 +237,28 @@ final class Session {
             await finish(recording)
         }
         recordings = [:]
+        terminalVideo?.windowsRecording = false
     }
 
-    func renderTerminal() async {
-        guard FileManager.default.fileExists(atPath: terminal) else { return }
-        let quietly = terminalClosed.load(ordering: .relaxed)
-        guard let failure = await render(quietly: quietly) else { return }
-        let terminalClosedDuringRender = !quietly && terminalClosed.load(ordering: .relaxed)
-        if terminalClosedDuringRender, await render(quietly: true) == nil {
+    func finishTerminalVideo() async {
+        guard let video = terminalVideo else { return }
+        guard FileManager.default.fileExists(atPath: terminal) else {
+            video.cancel()
             return
         }
-        problems.append(failure)
+        switch await video.finishShowingProgress(quietly: { terminalClosed.load(ordering: .relaxed) }) {
+        case .saved:
+            break
+        case .cancelled:
+            problems.append("stopped before the terminal video was finished, so there's no terminal video")
+        case .failed(let reason):
+            problems.append("can't render the terminal video: \(reason)")
+        }
     }
 
     func report() {
-        let terminalFiles = FileManager.default.fileExists(atPath: terminal) ? [terminal] + [terminalVideo].compactMap { $0 } : []
+        let video = terminalVideo.flatMap { $0.outcome == .saved ? $0.path : nil }
+        let terminalFiles = FileManager.default.fileExists(atPath: terminal) ? [terminal] + [video].compactMap { $0 } : []
         let files = terminalFiles + saved.sorted()
         if !files.isEmpty {
             Console.saved(in: directoryInProject, files.map { ($0 as NSString).lastPathComponent })
@@ -254,66 +268,6 @@ final class Session {
 
     func removeDirectoryIfEmpty() {
         rmdir(directory)
-    }
-
-    private func render(quietly: Bool) async -> String? {
-        let video = (terminal as NSString).deletingPathExtension + ".mp4"
-        let scratch = (NSTemporaryDirectory() as NSString).appendingPathComponent("worktape-\(UUID().uuidString)")
-        let animation = scratch + ".gif"
-        let rendering = scratch + ".mp4"
-        defer {
-            try? FileManager.default.removeItem(atPath: animation)
-            try? FileManager.default.removeItem(atPath: rendering)
-        }
-
-        Console.note("rendering \((video as NSString).lastPathComponent), ctrl+c to skip")
-        let size = try? await terminalSize(of: terminal)
-        let font = size.map { fontSize(columns: $0.columns, rows: $0.rows) } ?? largestFontSize
-        let agg = ["agg", "--font-size", String(font), "--idle-time-limit", "0.5", terminal, animation]
-        let ffmpeg = [
-            "ffmpeg", "-nostdin", "-v", "error", "-i", animation,
-            "-vf", "fps=30,scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart", rendering,
-        ]
-        if let failure = await run(agg, discardingOutput: quietly, activity: nil) {
-            return failure
-        }
-        if let failure = await run(ffmpeg, discardingOutput: true, activity: quietly ? nil : "encoding") {
-            return failure
-        }
-
-        do {
-            try FileManager.default.moveItem(atPath: rendering, toPath: video)
-        } catch {
-            return "can't save the terminal video: \(error.localizedDescription)"
-        }
-        terminalVideo = video
-        return nil
-    }
-
-    private func run(_ arguments: [String], discardingOutput: Bool, activity: String?) async -> String? {
-        let child: ChildProcess
-        do {
-            child = try ChildProcess.spawn(arguments, environment: ProcessInfo.processInfo.environment, discardingOutput: discardingOutput)
-        } catch {
-            return "can't run \(arguments[0]) to render the terminal video: \(error.localizedDescription)"
-        }
-        renderPID.store(child.pid, ordering: .relaxed)
-        defer { renderPID.store(0, ordering: .relaxed) }
-
-        let started = ContinuousClock.now
-        var frame = 0
-        while !child.hasExited() {
-            if let activity {
-                Console.working(activity, frame: frame, elapsed: ContinuousClock.now - started)
-            }
-            frame += 1
-            try? await Task.sleep(for: .milliseconds(100))
-        }
-        if activity != nil {
-            Console.doneWorking()
-        }
-        return child.exitCode == 0 ? nil : "\(arguments[0]) didn't finish, so there's no terminal video"
     }
 
     private func newRecording(named name: String) -> String {
@@ -336,32 +290,6 @@ final class Session {
             problems.append("\((recording.path as NSString).lastPathComponent) may be unplayable: \(error.localizedDescription)")
         }
     }
-}
-
-let largestFontSize = 32
-
-func fontSize(columns: Int, rows: Int) -> Int {
-    let aggCellWidth = 0.6
-    let aggLineHeight = 1.4
-    // agg pads the video by half a cell on every side.
-    let widest = 3840 / (Double(columns + 1) * aggCellWidth)
-    let tallest = 2160 / (Double(rows + 1) * aggLineHeight)
-    return max(1, Int(min(Double(largestFontSize), widest, tallest)))
-}
-
-func terminalSize(of cast: String) async throws -> (columns: Int, rows: Int)? {
-    struct Header: Decodable {
-        struct Terminal: Decodable {
-            let cols: Int
-            let rows: Int
-        }
-        let term: Terminal
-    }
-    for try await line in URL(filePath: cast).lines {
-        let header = try JSONDecoder().decode(Header.self, from: Data(line.utf8))
-        return (header.term.cols, header.term.rows)
-    }
-    return nil
 }
 
 struct SessionExists: Error {

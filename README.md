@@ -12,12 +12,12 @@ worktape needs macOS 15 or later.
 brew install carldaws/tap/worktape
 ```
 
-Homebrew also installs asciinema, agg and ffmpeg. macOS asks for screen recording permission on the first recording.
+Homebrew also installs asciinema. macOS asks for screen recording permission on the first recording.
 
 To build it yourself:
 
 ```sh
-brew install asciinema agg ffmpeg
+brew install asciinema
 swift build -c release
 cp .build/release/worktape ~/.local/bin/
 ```
@@ -35,7 +35,7 @@ worktape stop     # stops it
 
 worktape records each window you open from the recorded shell. A recording ends when its window closes or you pause. Resuming starts a new recording for each open window.
 
-When you stop, worktape renders the terminal recording as a video. It plays at normal speed, cuts pauses to half a second and fits in 4K. `ctrl+c` skips this step.
+worktape renders the terminal recording as a video while you record, and holds off while it records a window. When you stop, it finishes the video. The video plays at normal speed, cuts pauses to half a second and fits in 4K.
 
 Each session gets its own folder, named after the time it started. Window videos start with the time each one started:
 
@@ -61,9 +61,9 @@ worktape record "fixing the jump"
     2026-10-21-233459-editor.mov
 ```
 
-`.worktapes/` ignores itself in git. You can render the `.cast` again with [agg](https://docs.asciinema.org/manual/agg/).
+`.worktapes/` ignores itself in git.
 
-Terminal videos use JetBrains Mono when it is installed. Install it with `brew install --cask font-jetbrains-mono`.
+Terminal videos use JetBrains Mono when it is installed. Install it with `brew install --cask font-jetbrains-mono`. Nerd Font icons work without installing anything.
 
 ## Shell hook
 
@@ -94,4 +94,4 @@ swift test
 Tests/Integration/run.sh
 ```
 
-The integration tests record real sessions. They need asciinema, agg, ffmpeg and screen recording permission.
+The integration tests record real sessions. They need asciinema, ffmpeg and screen recording permission.
