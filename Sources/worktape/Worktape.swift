@@ -11,6 +11,8 @@ struct Worktape {
             exit(await record(arguments[1]))
         case ["stop"]:
             exit(stop())
+        case let arguments where arguments.count == 2 && arguments[0] == "render":
+            exit(await render(arguments[1]))
         case ["init"]:
             exit(initialise(FileManager.default.currentDirectoryPath))
         case ["hook", "zsh"]:
@@ -30,6 +32,7 @@ usage: worktape <command>
   init                    set up .worktapes/ in this directory
   record [description]    record this terminal and the windows opened from it
   stop                    stop the recording this shell is part of
+  render <cast>           render a terminal recording as a video
   hook zsh                print a zsh hook that reminds you to record
 """
 
@@ -43,6 +46,37 @@ func stop() -> Int32 {
     }
     kill(pid, SIGTERM)
     return 0
+}
+
+func render(_ cast: String) async -> Int32 {
+    guard FileManager.default.fileExists(atPath: cast) else {
+        log("can't find \(cast)")
+        return 1
+    }
+    let path = (cast as NSString).deletingPathExtension + ".mp4"
+    guard !FileManager.default.fileExists(atPath: path) else {
+        log("\(path) already exists")
+        return 1
+    }
+    let video = TerminalVideo.start(from: cast, to: path)
+    let stopSignals = [SIGINT, SIGTERM, SIGHUP].map { stop in
+        signal(stop, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: stop, queue: .main)
+        source.setEventHandler { video.cancel() }
+        source.resume()
+        return source
+    }
+    defer { stopSignals.forEach { $0.cancel() } }
+
+    switch await video.finishShowingProgress(quietly: { false }) {
+    case .saved:
+        return 0
+    case .cancelled:
+        return 1
+    case .failed(let reason):
+        log("can't render \(cast): \(reason)")
+        return 1
+    }
 }
 
 func log(_ message: String) {

@@ -61,7 +61,11 @@ worktape record "fixing the jump"
     2026-10-21-233459-editor.mov
 ```
 
-`.worktapes/` ignores itself in git.
+`.worktapes/` ignores itself in git. To render a `.cast` again, move its video aside and run:
+
+```sh
+worktape render .worktapes/2026-10-21-233457/2026-10-21-233457.cast
+```
 
 Terminal videos use JetBrains Mono when it is installed. Install it with `brew install --cask font-jetbrains-mono`. Nerd Font icons work without installing anything.
 
