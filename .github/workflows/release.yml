@@ -1,0 +1,20 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: swift build --configuration release --arch arm64 --arch x86_64
+      - run: tar -czf "worktape-$GITHUB_REF_NAME-macos.tar.gz" -C .build/apple/Products/Release worktape
+      - run: gh release create "$GITHUB_REF_NAME" "worktape-$GITHUB_REF_NAME-macos.tar.gz" --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
